@@ -61,12 +61,19 @@ def make_sandbox(name):
     沙盒固定在 /c/tmp 下：sh 是 msys 的，C:/Users/... 这种原生路径它不认，
     脚本里的 $MODDIR/plugin-pack 拼出来就找不到目录，测试会误以为脚本没跑。
     """
-    root = "C:/tmp/a2asetup"
-    os.makedirs(root, exist_ok=True)
-    base = tempfile.mkdtemp(prefix=name + "-", dir=root)
-    # 传给 sh 的那一份要 msys 形式（/c/tmp/...），否则脚本里的路径拼不出来
-    base_sh = subprocess.run(["cygpath", "-u", base],
-                             capture_output=True, text=True).stdout.strip() or base
+    # 极端情况下连临时目录都建不出来，直接退到系统默认
+    try:
+        base = tempfile.mkdtemp(prefix="a2asetup-" + name + "-")
+    except Exception:  # noqa: BLE001
+        base = tempfile.mkdtemp(prefix="a2asetup-" + name + "-")
+    # 传给 sh 的那一份：msys 下要 /c/tmp 形式，Linux（CI）下原样即可。
+    # cygpath 只有 msys 有，不能无条件调 —— 之前就因为在 Ubuntu runner 上
+    # 找不到 cygpath 把整条流水线打断了。
+    base_sh = base
+    if shutil.which("cygpath"):
+        out = subprocess.run(["cygpath", "-u", base], capture_output=True, text=True)
+        if out.returncode == 0 and out.stdout.strip():
+            base_sh = out.stdout.strip()
     mod = os.path.join(base, "mod")
     data = os.path.join(base, "data")
     os.makedirs(os.path.join(mod, "plugin-pack", "bin"))
