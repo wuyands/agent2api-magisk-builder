@@ -72,7 +72,34 @@ ver_gt() {
   return 1
 }
 
+# 注册表外壳是否还完整：必须是 `{` 开头、且还带着 `"packs"` 键。
+#
+# 为什么单独查这一条：上一版模块的升级路径靠「向前找独立成行的 `{`」定位包对象，
+# 遇到把元素压成一行的紧凑注册表会**误抓到最外层那个 `{`**，于是整个
+# `{"packs":[...]}` 被一条裸的 pack 对象替换掉。网关 load() 解析失败后按空表
+# 处理 —— 表现就是「插件文件都在、目录也对，但一家提供商都不出现」，
+# 而且日志里没有任何报错。这种形状救不回来，只能按模板重建。
+#
+# 注意这里**不**检查本包在不在：注册表合法但装着别的包是正常状态。
+registry_ok() {
+  [ -f "$REG" ] || return 1
+  [ -s "$REG" ] || return 1
+  head -c 1 "$REG" 2>/dev/null | grep -q '{' || return 1
+  grep -q '"packs"' "$REG" 2>/dev/null || return 1
+  return 0
+}
+
 registered=$(reg_version)
+
+# 外壳坏了（见 registry_ok 的说明）：备份成 .broken 后删掉，让它走下面的
+# 「注册表不存在 → 整份写模板」分支。代价只是用户对单个提供商的手工开关回到
+# 默认值，比整个插件静默失效强得多。
+if [ -f "$REG" ] && ! registry_ok; then
+  cp "$REG" "$REG.broken" 2>/dev/null
+  rm -f "$REG" 2>/dev/null
+  registered=""
+  log "注册表外壳不可用（缺 packs 键或被压成单条）—— 已备份为 plugins.json.broken，按模板重建"
+fi
 if [ -n "$registered" ] && ver_gt "$registered" "$PACK_VER"; then
   # 注册表里是更高的版本：用户在面板里升级过，模块不能把它降下来
   log "注册表已是 v$registered（高于模块自带 v$PACK_VER）—— 跳过（不降级）"
@@ -145,18 +172,37 @@ if [ -n "$registered" ]; then
       ;;
   esac
 
-  # 向前找对象起始行（去掉缩进后恰好是 { 的那一行）
-  startline=$(head -n "$idline" "$REG" 2>/dev/null \
+  # 向前找包对象的起始行（去掉缩进后恰好是 { 的那一行）。
+  #
+  # 两个必须的限制，都是踩过的坑：
+  #   ① 只在本包的 id 行与 packs 键之间找 —— 否则会一路往上抓到最外层那个 {，
+  #      把整个 {"packs":[...]} 换成一条裸条目。那种文件网关解析失败后按空表
+  #      处理，表现是「插件文件都在、目录也对，但一家提供商都不出现」，而且
+  #      日志里没有任何报错；
+  #   ② 起点的缩进必须比 packs 行深，作为第二道闸（紧凑注册表里没有独立的
+  #      { 行，那种形状由上面的外壳检查拦下，走不到这里）。
+  packs_at=$(grep -n '"packs"' "$REG" 2>/dev/null | head -n 1 | cut -d: -f1)
+  case "$packs_at" in ''|*[!0-9]*) packs_at=1 ;; esac
+  packs_indent=$(sed -n "${packs_at}p" "$REG" 2>/dev/null | sed 's/[^[:space:]].*$//')
+
+  startline=$(tail -n +$((packs_at + 1)) "$REG" 2>/dev/null \
+    | head -n $((idline - packs_at)) \
     | grep -n '^[[:space:]]*{[[:space:]]*$' \
     | tail -n 1 | cut -d: -f1)
+  if [ -n "$startline" ]; then
+    startline=$((startline + packs_at))
+  fi
   case "$startline" in
     ''|*[!0-9]*)
       log "找不到本包对象起始行，保留原注册表"
       exit 0
       ;;
   esac
-
   indent=$(sed -n "${startline}p" "$REG" 2>/dev/null | sed 's/[^[:space:]].*$//')
+  if [ "${#indent}" -le "${#packs_indent}" ]; then
+    log "包对象起始行缩进不深于 packs 行（疑似抓到外层对象）—— 保留原注册表"
+    exit 0
+  fi
 
   # 向后找对象结束行（同一缩进 + } ，可能带逗号）
   endrel=$(tail -n +$((startline + 1)) "$REG" 2>/dev/null \
@@ -187,6 +233,7 @@ if [ -n "$registered" ]; then
   if [ -s "$upgrade_tmp" ] \
      && head -n 1 "$upgrade_tmp" | grep -q '{' \
      && tail -n 5 "$upgrade_tmp" | grep -q '}' \
+     && grep -q '"packs"' "$upgrade_tmp" \
      && grep -q "\"version\"[[:space:]]*:[[:space:]]*\"$PACK_VER\"" "$upgrade_tmp"; then
     mv "$upgrade_tmp" "$REG" 2>/dev/null
     log "已把注册表里的 $PACK_ID 从 v$registered 替换为 v$PACK_VER（第 $startline-$endline 行）"

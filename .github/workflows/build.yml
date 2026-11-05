@@ -127,6 +127,11 @@ jobs:
           echo "NDK: $root"
 
       # ── 拉两个上游 ────────────────────────────────────────────
+      - name: 跑单元测试（补丁引擎 / 版本映射）
+        run: |
+          set -euo pipefail
+          python3 tests/test_patches.py
+
       - name: 拉上游网关
         run: |
           set -euo pipefail
@@ -207,6 +212,12 @@ jobs:
             --providers-bin "$RUNNER_TEMP/out/agent2api-providers" \
             --ui-ui build/up/desktop-tauri/ui \
             --plugin-src build/px
+
+      - name: 跑单元测试（注册表铺设）
+        run: |
+          set -euo pipefail
+          # 这组要读 module/plugin-registry/ 里的模板，所以必须排在生成清单之后
+          python3 tests/test_plugin_setup.py
 
       - name: 打包
         id: pack
