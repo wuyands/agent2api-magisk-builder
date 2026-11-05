@@ -163,6 +163,27 @@ check(names_fe == sorted(names_fe), "frontend 组按文件名排序（%d 个）"
 check([n for n, _ in engine.collect("rust", only="frontend")] == [],
       "--only frontend 时不收集 rust")
 
+print("[7] 上游版本判定")
+import upstream  # noqa: E402
+
+# 字符串比较会把 v3.10.0 判成比 v3.9.0 小；tags 接口的返回顺序也不是版本序。
+check(upstream.version_key("v3.4.2") == (3, 4, 2), "v3.4.2 → (3,4,2)")
+check(upstream.version_key("3.4.2") == (3, 4, 2), "不带 v 也能解析")
+check(upstream.version_key("v3.3.0-beta.6") is None, "beta 一律跳过")
+check(upstream.version_key("v3.4") is None, "位数不对的 tag 跳过")
+pairs = [("v3.9.0", "v3.10.0"), ("v3.4.1", "v3.4.2"), ("v3.10.7", "v4.0.0")]
+for low, high in pairs:
+    check(upstream.version_key(high) > upstream.version_key(low),
+          "%s > %s" % (high, low))
+
+# 插件仓库的 release 停在 v0.2.0（真版本只在 tag 上），如果按 releases 查会
+# 永远认为插件是 0.2.0。这条锁死「按 tag 取版本、release 只用来捞时间」这个决定。
+import inspect  # noqa: E402
+
+_src = inspect.getsource(upstream.fetch_latest)
+check("/tags" in _src, "fetch_latest 按 tags 取版本（release 停在 v0.2.0 不可信）")
+check("/releases" in _src, "fetch_latest 仍去 releases 捞发布时间")
+
 print()
 print("=" * 60)
 print("失败 %d 项" % len(fails))
