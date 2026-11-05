@@ -1,0 +1,36 @@
+#!/sbin/sh
+#################
+# Magisk 模块安装入口（update-binary）
+#
+# 官方模板的固定四步：挂 /data → 载入 util_functions.sh → 校验 Magisk 版本
+# → install_module。模块自身的逻辑全部写在 customize.sh 里，由
+# install_module 在解包阶段调用。
+#################
+
+umask 022
+
+# 安装日志的输出函数（util_functions.sh 载入后会覆盖成更完整的实现）
+ui_print() { echo "$1"; }
+
+require_new_magisk() {
+  ui_print "*******************************"
+  ui_print " Please install Magisk v20.4+! "
+  ui_print "*******************************"
+  exit 1
+}
+
+#########################
+# Load util_functions.sh
+#########################
+
+OUTFD=$2
+ZIPFILE=$3
+
+mount /data 2>/dev/null
+
+[ -f /data/adb/magisk/util_functions.sh ] || require_new_magisk
+. /data/adb/magisk/util_functions.sh
+[ "$MAGISK_VER_CODE" -lt 20400 ] && require_new_magisk
+
+install_module
+exit 0

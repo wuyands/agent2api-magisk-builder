@@ -1,0 +1,285 @@
+name: build
+
+# 可手动触发（指定版本），也可被 daily.yml 复用（`uses: ./.github/workflows/build.yml`）。
+#
+# 一次构建做的事，顺序有硬约束：
+#   ① 拉两个仓库的源码 → ② 打补丁 → ③ **构建前端** → ④ 编译两个 Rust 二进制
+# ③ 必须在 ④ 之前，因为 `include_str!` 把 ui/islands/ui.js 编进了网关二进制
+# （见 server/src/server/api/plugin_theme.rs）。顺序反了会打出一个「界面还是旧版」
+# 的包，而且构建不会报错 —— 这种错误只能靠人肉发现，所以这里用注释钉死。
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "网关版本（形如 v3.4.2；留空读 upstream.json）"
+        required: false
+        type: string
+      plugin_version:
+        description: "插件版本（形如 3.4.2；留空读 upstream.json）"
+        required: false
+        type: string
+      release:
+        description: "构建成功后发布 Release"
+        required: false
+        default: true
+        type: boolean
+
+  workflow_call:
+    inputs:
+      version:
+        required: false
+        type: string
+      plugin_version:
+        required: false
+        type: string
+      release:
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ inputs.version || 'auto' }}
+  cancel-in-progress: false
+
+env:
+  NDK_VERSION: r27d
+  ANDROID_API: "26"
+  NODE_VERSION: "22"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      plugin_version: ${{ steps.ver.outputs.plugin_version }}
+      zip: ${{ steps.pack.outputs.zip }}
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v4
+
+      - name: 解析要构建的版本
+        id: ver
+        env:
+          IN_VERSION: ${{ inputs.version }}
+          IN_PLUGIN: ${{ inputs.plugin_version }}
+        run: |
+          set -euo pipefail
+          V="$IN_VERSION"
+          P="$IN_PLUGIN"
+          if [ -z "$V" ] || [ -z "$P" ]; then
+            OUT="$(python3 scripts/upstream.py)"
+            echo "$OUT"
+            [ -z "$V" ] && V="$(printf '%s\n' "$OUT" | sed -n 's/^gateway=//p')"
+            [ -z "$P" ] && P="$(printf '%s\n' "$OUT" | sed -n 's/^plugin=//p')"
+          fi
+          case "$V" in v*) ;; *) V="v$V" ;; esac
+          case "$P" in v*) P="${P#v}" ;; esac
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "plugin_version=$P" >> "$GITHUB_OUTPUT"
+          echo "构建目标：网关 $V ＋ 插件 $P"
+
+      - name: 装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 装 Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 装 Rust（含 aarch64-linux-android target）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: 缓存 NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ndk
+          key: ndk-${{ env.NDK_VERSION }}-linux
+
+      - name: 下载 NDK
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/ndk"
+          url="https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip"
+          echo "下载 $url"
+          curl -fL --retry 3 --retry-delay 5 -o "$RUNNER_TEMP/ndk.zip" "$url"
+          unzip -q "$RUNNER_TEMP/ndk.zip" -d "$RUNNER_TEMP/ndk"
+          rm -f "$RUNNER_TEMP/ndk.zip"
+          ls "$RUNNER_TEMP/ndk"
+
+      - name: 导出 NDK 路径
+        run: |
+          set -euo pipefail
+          root="$(find "$RUNNER_TEMP/ndk" -maxdepth 1 -type d -name 'android-ndk-*' | head -n 1)"
+          test -n "$root" || { echo "找不到解压后的 NDK"; exit 1; }
+          echo "ANDROID_NDK_HOME=$root" >> "$GITHUB_ENV"
+          echo "NDK: $root"
+
+      # ── 拉两个上游 ────────────────────────────────────────────
+      - name: 拉上游网关
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "${{ steps.ver.outputs.version }}" \
+            https://github.com/aimod-cc/Agent2API build/up
+
+      - name: 拉上游插件
+        run: |
+          set -euo pipefail
+          # 插件的 tag 不带 v；先试不带 v，再试带 v（上游这一处历史上两种都出现过）
+          if git clone --depth 1 --branch "${{ steps.ver.outputs.plugin_version }}" \
+               https://github.com/ProvidersPlugin/Agent2Providers build/px 2>/dev/null; then
+            echo "插件源码：tag ${{ steps.ver.outputs.plugin_version }}"
+          else
+            git clone --depth 1 --branch "v${{ steps.ver.outputs.plugin_version }}" \
+              https://github.com/ProvidersPlugin/Agent2Providers build/px
+            echo "插件源码：tag v${{ steps.ver.outputs.plugin_version }}"
+          fi
+
+      # ── ② 打补丁 ──────────────────────────────────────────────
+      - name: 应用补丁（Rust）
+        run: python3 patches/apply.py build/up --only rust
+
+      - name: 应用补丁（前端）
+        run: python3 patches/apply.py build/up --only frontend
+
+      # ── ③ 构建前端（必须早于 ④）────────────────────────────────
+      - name: 装前端依赖（ui-islands）
+        working-directory: build/up/desktop-tauri/ui-islands
+        run: npm ci --no-audit --no-fund
+
+      - name: 装前端依赖（ui-kit）
+        working-directory: build/up/desktop-tauri/ui-kit
+        run: |
+          # ui-islands 的 tsconfig 把 @ui 指到 ../ui-kit/src，typecheck 会去解析
+          # 那边的 react / @base-ui/react；这两个 node_modules 都不随仓库来，
+          # 单独装 ui-islands 会喷一屏 TS2307。两个都得装。
+          npm ci --no-audit --no-fund
+
+      - name: 查类型
+        working-directory: build/up/desktop-tauri/ui-islands
+        run: npm run typecheck
+
+      - name: 构建前端产物
+        working-directory: build/up/desktop-tauri/ui-islands
+        run: npm run build
+
+      # ── ④ 编译两个二进制 ──────────────────────────────────────
+      - name: 缓存 Rust 产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          # 两套 workspace 各自缓存；key 带上游版本，换版本时不复用旧产物
+          workspaces: |
+            build/up/desktop-tauri/src-tauri -> /tmp/target-gw
+            build/px -> /tmp/target-px
+          key: ${{ steps.ver.outputs.version }}-${{ steps.ver.outputs.plugin_version }}
+
+      - name: 编译网关
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-gw
+        run: |
+          chmod +x scripts/build.sh
+          scripts/build.sh server build/up/desktop-tauri/src-tauri "$RUNNER_TEMP/out/agent2api-server"
+
+      - name: 编译插件
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/target-px
+        run: |
+          scripts/build.sh providers build/px "$RUNNER_TEMP/out/agent2api-providers"
+
+      # ── 组装模块 ──────────────────────────────────────────────
+      - name: 生成模块清单
+        run: |
+          python3 scripts/prepare.py \
+            --version "${{ steps.ver.outputs.version }}" \
+            --plugin-version "${{ steps.ver.outputs.plugin_version }}" \
+            --server-bin "$RUNNER_TEMP/out/agent2api-server" \
+            --providers-bin "$RUNNER_TEMP/out/agent2api-providers" \
+            --ui-ui build/up/desktop-tauri/ui \
+            --plugin-src build/px
+
+      - name: 打包
+        id: pack
+        run: |
+          set -euo pipefail
+          name="agent2api-magisk-${{ steps.ver.outputs.version }}.zip"
+          python3 scripts/pack.py --out "out/$name"
+          echo "zip=$name" >> "$GITHUB_OUTPUT"
+
+      - name: 自检
+        run: |
+          python3 scripts/verify.py \
+            --zip "out/agent2api-magisk-${{ steps.ver.outputs.version }}.zip" \
+            --version "${{ steps.ver.outputs.version }}" \
+            --plugin-version "${{ steps.ver.outputs.plugin_version }}" \
+            --source build/up/desktop-tauri/src-tauri/server/src
+
+      - name: 留档（构建日志之外的可下载产物）
+        uses: actions/upload-artifact@v4
+        with:
+          name: agent2api-magisk-${{ steps.ver.outputs.version }}
+          path: out/*.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── 发布 ─────────────────────────────────────────────────
+      - name: 记录上游版本
+        run: python3 scripts/upstream.py --write --gateway "${{ steps.ver.outputs.version }}" --plugin "${{ steps.ver.outputs.plugin_version }}"
+
+      - name: 发布 Release
+        if: ${{ inputs.release }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          PLUGIN: ${{ steps.ver.outputs.plugin_version }}
+        run: |
+          set -euo pipefail
+          zip="out/agent2api-magisk-$VERSION.zip"
+          sum="$(sha256sum "$zip" | cut -d' ' -f1)"
+          notes="$RUNNER_TEMP/notes.md"
+          {
+            echo "同步上游 \`aimod-cc/Agent2API\` **$VERSION**"
+            echo ""
+            echo "- 提供商插件 \`ProvidersPlugin/Agent2Providers\` **$PLUGIN**"
+            echo "- 目标：Android arm64（API 26+），Magisk 20.4+"
+            echo "- 已裁掉桌面端专属功能（Agent 配置 / 工具本机接入 / 软件自更新 / Clash Verge / cc-switch 导入）"
+            echo ""
+            echo '```'
+            echo "sha256  $sum"
+            echo '```'
+            echo ""
+            echo "刷入：\`adb push agent2api-magisk-$VERSION.zip /data/local/tmp/\` 后"
+            echo "\`su -c magisk --install-module /data/local/tmp/agent2api-magisk-$VERSION.zip\`，重启生效。"
+          } > "$notes"
+
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "Release $VERSION 已存在，只补资产"
+            gh release upload "$VERSION" "$zip" --clobber
+          else
+            gh release create "$VERSION" "$zip" \
+              --title "Agent2API Magisk 模块 $VERSION" \
+              --notes-file "$notes"
+          fi
+
+      - name: 提交 upstream.json
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- upstream.json; then
+            echo "upstream.json 没变，跳过提交"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add upstream.json
+          git commit -m "chore: 记录上游版本 ${{ steps.ver.outputs.version }} / ${{ steps.ver.outputs.plugin_version }}"
+          git push

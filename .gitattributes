@@ -1,0 +1,14 @@
+# 一律按 LF 存、也按 LF 检出。
+#
+# 两个原因：
+#   · module/*.sh 会被打进 zip 里由 Android 的 mksh 执行 —— 带 CRLF 的 shell 脚本
+#     在 Android 上会莫名其妙地报 "not found"（`\r` 被当成命令名的一部分）；
+#   · patches/base.py 会把 CRLF 归一成 LF，但 pack.py 是直接读工作区文件的，
+#     所以工作区本身就得是 LF。
+* text=auto eol=lf
+
+# 二进制别碰
+*.png binary
+*.jpg binary
+*.webp binary
+*.so binary

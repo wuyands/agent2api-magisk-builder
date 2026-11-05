@@ -1,0 +1,17 @@
+# 构建输入（CI 每次重新 clone 上游与插件仓库）
+/build/
+
+# 由 scripts/prepare.py 生成的模块内容（zip 里必须有，仓库里不放）
+/module/bin/
+/module/ui/
+/module/plugin-pack/
+/module/plugin-registry/
+
+# 打包输出
+/out/
+*.zip
+
+# 本地探测与调试产物
+/work/
+__pycache__/
+*.pyc

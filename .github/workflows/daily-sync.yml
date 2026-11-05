@@ -1,0 +1,140 @@
+name: daily-sync
+
+# 每天问一次上游有没有新版本，有就跑一遍完整构建。
+#
+# 为什么「先说能构建成功才算数」：补丁是按文本锚点重放的，上游随手改一行注释
+# 就可能让某个补丁对不上。如果在写完 upstream.json 之后才去构建，仓库就会记着
+# 一个根本打不出来的版本，下次触发时还会去试同一个版本，形成死循环。
+# 所以这里的顺序是：探测 → **同一个 job 里先真构建一次** → 成功才记录版本、
+# 才发 release；失败就开 issue 把失败的补丁名贴在标题里，等人来修，
+# upstream.json 保持不动（下次还会再试，修好了自动补上）。
+
+on:
+  schedule:
+    # 04:17 UTC = 12:17 北京时间：避开 GitHub 整点高峰，也不在工作时间之外太久
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+concurrency:
+  group: daily-sync
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+      plugin_version: ${{ steps.check.outputs.plugin_version }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 探测上游
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          OUT="$(python3 scripts/upstream.py)"
+          echo "$OUT"
+          {
+            echo "changed=$(printf '%s\n' "$OUT" | sed -n 's/^changed=//p')"
+            echo "version=$(printf '%s\n' "$OUT" | sed -n 's/^gateway=//p')"
+            echo "plugin_version=$(printf '%s\n' "$OUT" | sed -n 's/^plugin=//p')"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: probe
+    if: needs.probe.outputs.changed == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.probe.outputs.version }}
+      plugin_version: ${{ needs.probe.outputs.plugin_version }}
+      release: true
+    secrets: inherit
+
+  alarm:
+    needs: [probe, build]
+    if: always() && needs.probe.outputs.changed == 'true' && needs.build.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 找出对不上的补丁
+        id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.probe.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$VERSION" \
+            https://github.com/aimod-cc/Agent2API /tmp/up || true
+          fail=""
+          if [ -d /tmp/up ]; then
+            for group in rust frontend; do
+              if ! python3 patches/apply.py /tmp/up --only "$group" > /tmp/"$group".log 2>&1; then
+                # 每个补丁独立跑一次，取第一个报错的名字
+                while IFS= read -r line; do
+                  if printf '%s' "$line" | grep -q '✗'; then fail="$fail $line"; break; fi
+                done < /tmp/"$group".log
+              fi
+              git -C /tmp/up checkout -- . >/dev/null 2>&1 || true
+              git -C /tmp/up clean -fdq >/dev/null 2>&1 || true
+            done
+          fi
+          echo "fail=$fail" >> "$GITHUB_OUTPUT"
+          if [ -n "$fail" ]; then echo "失败补丁：$fail"; else echo "补丁都能重放，失败原因在构建或自检环节"; fi
+
+      - name: 开 issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ needs.probe.outputs.version }}
+          PLUGIN: ${{ needs.probe.outputs.plugin_version }}
+          FAIL: ${{ steps.find.outputs.fail }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="上游 $VERSION 构建失败"
+          body="$RUNNER_TEMP/body.md"
+          {
+            echo "每日同步探测到上游新版本，但云编译没有通过。"
+            echo ""
+            echo "- 网关：\`$VERSION\`"
+            echo "- 插件：\`$PLUGIN\`"
+            echo "- 运行记录：$RUN_URL"
+            echo ""
+            if [ -n "$FAIL" ]; then
+              echo "**对不上的补丁**"
+              echo '```'
+              printf '%s\n' "$FAIL"
+              echo '```'
+              echo ""
+              echo "按这个顺序看：①上游是不是把锚点那段代码改了 → 更新 \`patches/*/NN_*.py\` 里的字符串；②是不是功能被上游自己挪走了 → 整个补丁可以删；③前端是不是又动了 \`settings-*\` / \`app.js\` 的写法。"
+            else
+              echo "补丁全部能重放，问题出在构建或自检。先看运行记录里红掉的那一步：常见是 NDK 下载失败、\`npm ci\` 装不上、或者 \`scripts/verify.py\` 的自检项。"
+            fi
+            echo ""
+            echo "修好之后手动跑一次 \`daily-sync\` 即可补上这一版。"
+          } > "$body"
+
+          if gh issue list --search "\"$title\" in:title" --state open | grep -q .; then
+            echo "已有同名未关 issue，追加评论"
+            num="$(gh issue list --search "\"$title\" in:title" --state open --json number --jq '.[0].number')"
+            gh issue comment "$num" --body-file "$body"
+          else
+            gh issue create --title "$title" --body-file "$body"
+          fi

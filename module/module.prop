@@ -1,0 +1,7 @@
+id=agent2api
+name=Agent2API 网关
+version=v3.4.2
+versionCode=3040200
+author=aimod-cc (Magisk 移植)
+description=本地 OpenAI 兼容 AI 网关：把多家 AI 桌面客户端的账号接到手机本机 3065 端口，任何支持自定义 base_url 的客户端都能直接调用。面板 http://127.0.0.1:3065/ ，开机自启，支持 WebUI 与命令行控制。
+updateJson=
