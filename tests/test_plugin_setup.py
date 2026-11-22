@@ -24,6 +24,13 @@ TEMPLATE = os.path.join(ROOT, "module", "plugin-registry", "plugins.json")
 ENTRY = os.path.join(ROOT, "module", "plugin-registry", "registry-entry.json")
 
 PACK_ID = "agent2api-providers"
+# 模块自带的插件版本：唯一真值在 plugin-setup.sh 的 PACK_VER= 那一行。
+# 写死在这里的话，模块一换版本（尤其切 beta 通道）整套断言就全挂。
+with open(SCRIPT, encoding="utf-8") as _fh:
+    PACK_VER = re.search(r"(?m)^PACK_VER=(\S+)\s*$", _fh.read()).group(1)
+# 「旧版」与「更高版本」都取到 3.x 之外，免得上游升主版本后又失效
+OLDER_VER = "3.0.0"
+HIGHER_VER = "9.9.9"
 fails = []
 
 
@@ -70,10 +77,16 @@ def make_sandbox(name):
     # cygpath 只有 msys 有，不能无条件调 —— 之前就因为在 Ubuntu runner 上
     # 找不到 cygpath 把整条流水线打断了。
     base_sh = base
-    if shutil.which("cygpath"):
-        out = subprocess.run(["cygpath", "-u", base], capture_output=True, text=True)
+    cyg = pick_cygpath()
+    if cyg:
+        out = subprocess.run([cyg, "-u", base], capture_output=True, text=True)
         if out.returncode == 0 and out.stdout.strip():
             base_sh = out.stdout.strip()
+    elif os.name == "nt":
+        # Windows 上没 cygpath 就没法把 C:\... 转成 /c/...，脚本必然跑不起来。
+        # 与其让 20 条断言一起挂（看不出真正原因），不如在这里说清楚。
+        sys.exit("Windows 上找不到 cygpath（试过 PATH 与 Git 的默认安装位置）；"
+                 "把它所在的 usr\\bin 加进 PATH 再跑")
     mod = os.path.join(base, "mod")
     data = os.path.join(base, "data")
     os.makedirs(os.path.join(mod, "plugin-pack", "bin"))
@@ -82,7 +95,7 @@ def make_sandbox(name):
 
     # 真实的 plugin-pack 太大（10MB 二进制），这里只要结构对、目录能搬过去
     with open(os.path.join(mod, "plugin-pack", "pack.json"), "w", encoding="utf-8") as fh:
-        json.dump({"id": PACK_ID, "version": "3.4.2", "protocol": 1}, fh)
+        json.dump({"id": PACK_ID, "version": PACK_VER, "protocol": 1}, fh)
     with open(os.path.join(mod, "plugin-pack", "bin", "agent2api-providers"), "w") as fh:
         fh.write("#!/bin/sh\nexit 0\n")
     os.chmod(os.path.join(mod, "plugin-pack", "bin", "agent2api-providers"), 0o755)
@@ -99,8 +112,46 @@ def make_sandbox(name):
     return script, data
 
 
+_CYGPATH_FALLBACKS = (
+    r"C:\Program Files\Git\usr\bin\cygpath.exe",
+    r"C:\Program Files\Git\bin\cygpath.exe",
+    r"C:\Program Files (x86)\Git\usr\bin\cygpath.exe",
+)
+
+
+def pick_cygpath():
+    """which → 常见绝对路径。CI（Linux）上没有也不需要，返回 None。"""
+    found = shutil.which("cygpath")
+    if found:
+        return found
+    for path in _CYGPATH_FALLBACKS:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+_SHELL_FALLBACKS = (
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+)
+
+
+def pick_shell():
+    """sh → bash → 常见 msys 绝对路径。CI 上第一轮就命中。"""
+    for name in ("sh", "bash"):
+        if shutil.which(name):
+            return name
+    for path in _SHELL_FALLBACKS:
+        if os.path.isfile(path):
+            return path
+    sys.exit("找不到 sh / bash，无法跑 plugin-setup.sh")
+
+
+SHELL = pick_shell()
+
+
 def run(script):
-    r = subprocess.run(["sh", script], capture_output=True, text=True)
+    r = subprocess.run([SHELL, script], capture_output=True, text=True)
     return r
 
 
@@ -123,18 +174,20 @@ if os.path.isfile(reg):
     checks = obj.get("packs") or []
     check(len(checks) == 1, "只有 1 个包")
     check(checks and checks[0].get("id") == PACK_ID, "包 id 正确")
-    check(checks and checks[0].get("version") == "3.4.2", "版本是 3.4.2")
+    check(checks and checks[0].get("version") == PACK_VER,
+          "版本是 %s（实际 %r）" % (PACK_VER, checks[0].get("version") if checks else None))
     provs = (checks[0].get("providers") or {}) if checks else {}
     check(len(provs) == 34, "providers 34 家（实际 %d）" % len(provs))
     check(provs.get("demo") is False, "demo 默认关")
-check(os.path.isfile(os.path.join(data, "plugins", PACK_ID, "3.4.2", "bin", "agent2api-providers")),
-      "插件二进制已铺设")
+check(os.path.isfile(os.path.join(data, "plugins", PACK_ID, PACK_VER,
+                                  "bin", "agent2api-providers")),
+      "插件二进制已铺设（%s）" % PACK_VER)
 
-print("[2] 模块升级 3.4.1 → 3.4.2：整条替换，packs 外壳必须留住")
+print("[2] 模块升级 %s → %s：整条替换，packs 外壳必须留住" % (OLDER_VER, PACK_VER))
 script, data = make_sandbox("upgrade")
 reg = registry(data)
 old = json.loads(read(TEMPLATE))
-old["packs"][0]["version"] = "3.4.1"
+old["packs"][0]["version"] = OLDER_VER
 old["packs"][0]["providers"].pop("astudio", None)
 old["packs"][0]["manifest_providers"] = [
     p for p in old["packs"][0]["manifest_providers"] if p["id"] != "astudio"
@@ -148,7 +201,8 @@ obj = json.loads(read(reg))
 check(isinstance(obj, dict) and "packs" in obj, "替换后仍是 {\"packs\": [...]} 外壳")
 if isinstance(obj, dict) and "packs" in obj:
     pack = obj["packs"][0]
-    check(pack["version"] == "3.4.2", "版本已升到 3.4.2")
+    check(pack["version"] == PACK_VER,
+          "版本已升到 %s（实际 %r）" % (PACK_VER, pack["version"]))
     check("astudio" in pack["providers"], "新提供商 astudio 已进 providers")
     check(len(pack["manifest_providers"]) == 34, "manifest_providers 34 家")
 check("走升级路径" in setup_log(data), "日志记录了走升级路径")
@@ -158,7 +212,7 @@ print("[3] 注册表被压成一条裸对象（上一版 bug 留下的形状）�
 script, data = make_sandbox("broken")
 reg = registry(data)
 with open(reg, "w", encoding="utf-8") as fh:
-    json.dump({"id": PACK_ID, "version": "3.4.2", "enabled": True,
+    json.dump({"id": PACK_ID, "version": PACK_VER, "enabled": True,
                "providers": {"demo": False}, "entry": "bin/agent2api-providers",
                "sha256": "", "signed": False, "installed_at": 0,
                "manifest_providers": []}, fh, ensure_ascii=False)
@@ -172,12 +226,17 @@ print("[4] 注册表里是更高版本 → 跳过，不动注册表")
 script, data = make_sandbox("higher")
 reg = registry(data)
 tpl = read(TEMPLATE)
+# 直接把模板里的 version 值换掉（不再靠 replace 字面量，
+# 模板换了版本之后那种写法会静默不命中，造出来的其实还是当前版本）
+obj = json.loads(tpl)
+obj["packs"][0]["version"] = HIGHER_VER
 with open(reg, "w", encoding="utf-8") as fh:
-    fh.write(tpl.replace('"version": "3.4.2"', '"version": "3.9.9"'))
+    json.dump(obj, fh, ensure_ascii=False, indent=2)
+    fh.write("\n")
 before = read(reg)
 run(script)
 check(read(reg) == before, "注册表字节未变")
-check("不降级" in setup_log(data), "日志说明跳过了更高版本")
+check("不降级" in setup_log(data), "日志说明跳过了更高版本（%s）" % HIGHER_VER)
 
 print("[5] 幂等：同一版本再跑一次，注册表字节不变")
 script, data = make_sandbox("idem")
