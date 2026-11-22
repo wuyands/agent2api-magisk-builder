@@ -115,7 +115,7 @@ fi
 
 ui_print "- 数据目录 /data/adb/agent2api（首次启动自动创建）"
 if [ -f "$MODPATH/plugin-pack/bin/agent2api-providers" ]; then
-  ui_print "- 已内置提供商插件 v3.4.2（首次启动自动铺设，34 家实现）"
+  ui_print "- 已内置提供商插件 v3.5.0-beta.3（首次启动自动铺设，34 家实现）"
 else
   ui_print "! 未内置提供商插件：v3.4.0 起账号页会显示为空"
 fi

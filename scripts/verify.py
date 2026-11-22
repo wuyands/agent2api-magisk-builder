@@ -25,6 +25,7 @@ import json
 import os
 import re
 import shutil
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -246,9 +247,16 @@ def check_versions(tmp, version, plugin_version):
         bad("registry-entry.json 有 %d 行" % raw.count(b"\n"))
 
 
-def check_binaries(tmp, plugin_version):
+def check_binaries(tmp, version, plugin_version):
     print("[4] 二进制")
-    for rel in ("bin/agent2api-server", "plugin-pack/bin/agent2api-providers"):
+    # 两个二进制各认自己的版本：网关串在 server 里，插件串在 providers 里。
+    # 正式版通道两者同号（3.4.2/3.4.2），以前用同一个参数没出过问题；
+    # beta 通道网关 3.5.0-beta.7、插件 3.5.0-beta.3，必须分开比。
+    wanted = [
+        ("bin/agent2api-server", version, "网关"),
+        ("plugin-pack/bin/agent2api-providers", plugin_version, "插件"),
+    ]
+    for rel, want, label in wanted:
         path = os.path.join(tmp, rel)
         if not os.path.isfile(path):
             continue
@@ -261,22 +269,41 @@ def check_binaries(tmp, plugin_version):
             bad(rel + " 不是 aarch64（e_machine=%r）" % blob[18:20])
             continue
         found = sorted({m.group(0).decode() for m in re.finditer(rb"\d+\.\d+\.\d+", blob)})
-        # 二进制里会混入各种依赖的版本号，只认「等于本版」这一条
-        if plugin_version.encode() in blob:
-            ok("%s 是 aarch64 ELF，内嵌 %s（%d 字节）" % (rel, plugin_version, len(blob)))
+        # 二进制里会混入各种依赖的版本号，只认「等于本版」这一条。
+        # 注意版本串在二进制里没有 `v` 前缀（Cargo 的 CARGO_PKG_VERSION 从不带 v，
+        # 而网关 tag 带 v），所以两边都要按去 v 的形式比。
+        probe = want.lstrip("v")
+        if probe.encode() in blob:
+            ok("%s 是 aarch64 ELF，内嵌%s %s（%d 字节）"
+               % (rel, label, probe, len(blob)))
         else:
-            warn("%s 里找不到 %s（可能只在网关侧；发现 %r）"
-                 % (rel, plugin_version, [v for v in found if v.startswith(plugin_version[0])][:6]))
+            warn("%s 里找不到%s %s（发现 %r）"
+                 % (rel, label, probe,
+                    [v for v in found if v.startswith(probe[0])][:6]))
 
 
 def check_frontend(tmp, patched=True):
     print("[5] 前端")
     ui_dir = os.path.join(tmp, "ui")
     n = sum(len(files) for _, _, files in os.walk(ui_dir))
-    if n >= 200:
+    # 120 是下限不是目标：v3.4.2 有 257 个文件，beta 精简到 167。
+    # 文件数只说明「铺了东西」，所以下面还有两条体积/存在性判据。
+    if n >= 120:
         ok("ui/ %d 个文件" % n)
     else:
         bad("ui/ 只有 %d 个文件（看着像没铺全）" % n)
+
+    big = os.path.join(tmp, "ui/islands/ui.js")
+    if os.path.isfile(big) and os.path.getsize(big) >= 1024 * 1024:
+        ok("ui/islands/ui.js %.1f MB（是打包产物不是空壳）" % (os.path.getsize(big) / 1048576.0))
+    else:
+        bad("ui/islands/ui.js 缺失或小于 1 MB")
+
+    for rel in ("ui/index.html", "ui/m.html"):
+        if os.path.isfile(os.path.join(tmp, rel)):
+            ok(rel + " 在")
+        else:
+            bad(rel + " 缺失（手机浏览器与 /m 都靠它）")
 
     for rel in ("ui/sidebar-layout.js", "ui/app.js", "ui/islands/ui.js", "ui/islands/login.js"):
         path = os.path.join(tmp, rel)
@@ -350,14 +377,38 @@ def check_routes(source, patched=True):
         ok("没有已裁端点的路由字面量")
 
 
+# 本机 msys 的 bash 常常不在 PATH 上（PowerShell 子进程尤其如此），
+# 所以 which 查不到时再试这几个固定位置。CI 上第一轮 `sh` 就命中，走不到这里。
+_SHELL_FALLBACKS = (
+    r"C:\Program Files\Git\bin\bash.exe",
+    r"C:\Program Files\Git\usr\bin\bash.exe",
+    r"C:\Program Files (x86)\Git\bin\bash.exe",
+)
+
+
+def _pick_shell():
+    """sh → bash 依次找。CI 上两者都有；本机 msys 只有 bash。"""
+    for name in ("sh", "bash"):
+        if shutil.which(name):
+            return name
+    for path in _SHELL_FALLBACKS:
+        if os.path.isfile(path):
+            return path
+    return None
+
+
 def check_shells(tmp):
     print("[7] shell 语法")
+    shell = _pick_shell()
+    if shell is None:
+        warn("找不到 sh / bash，跳过脚本语法检查（CI 上不会走到这里）")
+        return
     bad_scripts = []
     for rel in SHELLS:
         path = os.path.join(tmp, rel)
         if not os.path.isfile(path):
             continue
-        r = subprocess.run(["sh", "-n", path], capture_output=True, text=True)
+        r = subprocess.run([shell, "-n", path], capture_output=True, text=True)
         if r.returncode != 0:
             bad_scripts.append("%s：%s" % (rel, r.stderr.strip()[:160]))
     if bad_scripts:
@@ -445,7 +496,7 @@ def main():
         check_files(tmp)
         check_prop(tmp, args.version)
         check_versions(tmp, args.version, args.plugin_version)
-        check_binaries(tmp, args.plugin_version)
+        check_binaries(tmp, args.version, args.plugin_version)
         check_frontend(tmp, patched)
         check_routes(args.source, patched)
         check_shells(tmp)
