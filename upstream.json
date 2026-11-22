@@ -1,4 +1,5 @@
 {
+  "channel": "stable",
   "gateway": "v3.4.2",
   "plugin": "3.4.2",
   "gateway_published": "2026-11-05T07:53:41Z",

@@ -236,6 +236,75 @@ issue 追加 comment）。
 
 ---
 
+## 通道：stable 与 beta
+
+`upstream.json` 里的 `channel` 字段决定每天跟哪条线：
+
+```json
+{ "gateway": "v3.4.2", "plugin": "3.4.2", "channel": "stable", ... }
+```
+
+| 通道 | 看什么 tag | 典型值 |
+| --- | --- | --- |
+| `stable`（默认） | 只认 `vX.Y.Z`，带 `-` 的一律跳过 | `v3.4.2` / `3.4.2` |
+| `beta` | 连 `vX.Y.Z-beta.N` 一起看，取版本号最大的 | `v3.5.0-beta.7` / `3.5.0-beta.3` |
+
+切换方式（二选一）：
+
+- 改 `upstream.json` 的 `channel` 提一次提交 —— daily-sync 下次探测就跟着变；
+- 手动跑 `daily-sync` 时在 `channel` 输入框临时指定（不落盘，只影响这一次）。
+
+排序不是字符串比较：`version_key()` 把 tag 拆成 `(major, minor, patch, stage)`，
+其中正式版的 `stage=100`、预发布的 `stage=序号`。于是 `beta.7 > beta.6`、
+`3.5.0 > 3.5.0-beta.7`、`v3.10.0 > v3.9.0` —— 这三条都是字符串比较会答错的。
+
+### `inputs.patch=false`：原样编一遍
+
+`build.yml` 的 `patch` 开关关掉时，**一个裁剪补丁都不打**：Agent 配置页、工具本机接入、
+软件自更新、Clash Verge 读取、cc-switch 导入全部留在产物里。它的用途只有一个 ——
+上游发了新版，先确认「这份代码能不能编过、跑不跑得起来」，再决定要不要花力气适配补丁。
+
+配套的三处联动（都不是可选的）：
+
+1. **自检加 `--no-patch`**：默认那两组检查要求「被裁功能的入口必须缺席」，原样包本来
+   就该有它们，不关掉这两组会永远红。
+2. **Release tag 加 `-raw` 后缀**（如 `v3.5.0-beta.7-raw`）并标 `prerelease`：同一个上游
+   版本可能既有一个正式模块、又有一个原样试跑模块，共用 tag 会互相覆盖资产。
+3. **不写 `upstream.json`**：那是「日常出包跟到哪」的水位线，一次试跑不该把它推上去，
+   否则 daily-sync 会以为这版已经出过正式包，再也不补了。
+
+原样包**不要当日常包用**：那五块功能在手机上本来就没有意义 —— Agent 配置页读不到也写
+不进客户端配置目录，本机接入装不了桌面客户端，软件自更新没有可替换的安装包，Clash
+Verge 配置根本不存在，cc-switch 也没有可导入的源。它们的表现是「点进去一片空白」而不是
+报错，很容易被当成 bug。
+
+### `scripts/android-target-fixes.py`：补 Android 目标的编译
+
+上游 CI 只编 windows / macos / linux，从没编过 `aarch64-linux-android`。个别代码按平台
+用 `#[cfg]` 分支，而**桌面三平台的每一支都成立、Android 一支都不成立**：
+
+```rust
+let mut roots = Vec::new();
+#[cfg(windows)]           { roots.push(...); }
+#[cfg(target_os="macos")] { roots.push(...); }
+#[cfg(target_os="linux")] { roots.push(...); }
+// Android：三条全不成立 → E0282 推断不出 Vec 的元素类型
+```
+
+这类错误在桌面 CI 里永远撞不出来，只能在我们这边补。这个脚本与 `patches/` 是**两回事**：
+
+| | `patches/` | `scripts/android-target-fixes.py` |
+| --- | --- | --- |
+| 改什么 | 删功能（去文件、去路由、去面板） | 只补编译（加类型标注） |
+| 能不能关 | 能（`inputs.patch=false`） | 不能，打不打补丁都要跑 |
+| 失败后果 | 构建红，等人工适配新版 | 构建红，说明上游又加了新的 Android 盲区 |
+
+每条修补都是「精确锚点 + 命中计数断言 + 幂等」：跑第二遍说「已修好」，锚点对不上直接
+报错退出（不猜、不尽力而为）。**上游一旦自己修了这处，脚本会报「目标文件里找不到锚点」
+而不是静默跳过 —— 那时把对应条目删掉即可。**
+
+---
+
 ## 验证做到了什么程度
 
 `scripts/verify.py` 对**产出的 zip** 做 9 组检查，任何一组失败就不发 release：
@@ -254,6 +323,9 @@ issue 追加 comment）。
 7. 8 个 shell 脚本过 `sh -n`
 8. 5 个 JSON 严格解析
 9. zip 的 CRC 全部通过；10 个可执行项权限必须是 `0755`（缺了 `update-binary` 就跑不起来）
+
+**加 `--no-patch` 时第 5、6 组会跳过**（原样包本来就该有那些入口）—— 但必备文件、版本
+一致性、二进制架构、shell 语法、JSON、CRC、权限位这七组照旧全查。
 
 除了 `verify.py`，仓库里还有两层：
 

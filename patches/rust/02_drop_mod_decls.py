@@ -3,6 +3,12 @@
 
 删完文件后 `pub mod agents;` 这类声明会指向不存在的文件，编译直接报 E0583。
 这里把声明连同它上方的说明注释一起删掉 —— 注释留着会描述一个不存在的模块。
+
+── 为什么不是「两行一起删」 ──────────────────────────────────
+v3.4.2 里 `pub mod agents;` 与 `pub mod agent_resources;` 是紧挨着的，一条替换
+就能带走两行。v3.5 在上游插进了 `pub mod advertisements;`，两行被拆开了 ——
+按「相邻」写的锚点必然失效。改成一行一行删，中间夹了什么新模块都不影响。
+`mod bridge;` / `mod install;` 同理（v3.5 在两者之间插了 `image_bridge` 三行）。
 """
 
 from base import must_replace
@@ -17,7 +23,11 @@ EDITS = [
     (
         SRC + "/server/api/mod.rs",
         "// 「Agent」页：本机 AI 客户端配置接管（列表 / 保存 / 写入 / 预览 / 还原 / 导入）\n"
-        "pub mod agents;\n"
+        "pub mod agents;\n",
+        "",
+    ),
+    (
+        SRC + "/server/api/mod.rs",
         "pub mod agent_resources;\n",
         "",
     ),
@@ -54,12 +64,21 @@ EDITS = [
     # ── tool_services/mod.rs ──
     (
         SRC + "/server/core/tool_services/mod.rs",
-        "mod bridge;\nmod install;\n",
+        "mod bridge;\n",
         "",
     ),
     (
         SRC + "/server/core/tool_services/mod.rs",
-        "pub use bridge::VISION_BRIDGE_SCRIPT;\n"
+        "mod install;\n",
+        "",
+    ),
+    (
+        SRC + "/server/core/tool_services/mod.rs",
+        "pub use bridge::VISION_BRIDGE_SCRIPT;\n",
+        "",
+    ),
+    (
+        SRC + "/server/core/tool_services/mod.rs",
         "pub use install::{\n"
         "    install_mcp, install_skill, mcp_targets, skill_targets, uninstall_mcp, uninstall_skill,\n"
         "    InstallOutcome,\n"

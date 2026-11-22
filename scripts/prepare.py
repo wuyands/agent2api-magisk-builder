@@ -56,21 +56,51 @@ def write_json(path, obj, indent=None, separators=None, trailing_newline=True):
 
 
 def code_of(version):
-    """v3.4.2 → 3040200。规则：major*1000000 + minor*10000 + patch*100。
+    """v3.4.2 → 304020100，v3.5.0-beta.7 → 305000007。
 
-    Magisk 只用它比大小，所以要求「段位越高数越大」且**永不撞车**。
-    早期移植用的是 major*10000 + minor*1000 + patch*100（3.4.2→34200），
-    但那个规则在 minor 到两位数时会撞：3.10.7 与 4.0.7 都算出 40700。
-    上游现在还在 3.x，可这套东西是要长期跟着上游跑的，把位宽一次留够：
-    minor 与 patch 各两位，major 不设上限。
+    规则：``major*1e8 + minor*1e6 + patch*1e4 + stage``，
+    其中 ``stage`` 正式版固定 100、预发布是它的序号（``beta.7`` → 7）。
+
+    Magisk 只用它比大小，所以要求「段位越高数越大」且**永不撞车**。三层约束：
+
+    1. **段位之间不重叠**：minor 步进 1e6 > patch 最大值 99*1e4=990000；
+       major 步进 1e8 > minor 最大值 99*1e6。所以任何两位以内的
+       minor/patch 都不会顶到上一段去。
+    2. **同号时正式版最大**：stage 正式版取 100，预发布取 1..99。
+       于是 ``3.5.0-beta.7 (305000007) < 3.5.0 (305000100)``。
+    3. **预发布之间按序号递增**：``beta.6 (6) < beta.7 (7)``。
+       序号超过 99 会被拒绝（上游现在到 beta.7，留够两位数）。
+
+    为什么不再沿用 ``major*1e6 + minor*1e4 + patch*1e2``：那套在
+    ``minor`` 到两位数时会撞（3.10.7 与 4.0.7 都算出 40700 的后两位），
+    而且 patch 段只留了 100 个空位，装不下 beta 序号。这里一次把位宽排够。
+
+    历史值不兼容是**有意的**：旧包是 versionCode=3040200（v3.4.2），
+    新规则下同一版本是 304020100，恒大于旧值，Magisk 判升级不受影响。
     """
-    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", version.strip())
+    text = version.strip()
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?", text)
     if not m:
-        die("看不懂的版本号：%r（要形如 v3.4.2）" % version)
-    major, minor, patch = (int(x) for x in m.groups())
+        die("看不懂的版本号：%r（要形如 v3.4.2 或 v3.5.0-beta.7）" % version)
+    major, minor, patch = (int(x) for x in m.group(1, 2, 3))
+    pre = m.group(4)
     if minor > 99 or patch > 99:
         die("版本号超出映射位宽（minor / patch 需 ≤ 99）：%s" % version)
-    return major * 1000000 + minor * 10000 + patch * 100
+
+    if not pre:
+        stage = 100
+    else:
+        if "-" in pre:
+            die("预发布段只能有一层（形如 -beta.7）：%s" % version)
+        seq = 0
+        for piece in re.split(r"[.\-]", pre):
+            if piece.isdigit():
+                seq = max(seq, int(piece))
+        if seq <= 0 or seq > 99:
+            die("预发布序号需在 1..99：%s" % version)
+        stage = seq
+
+    return major * 100000000 + minor * 1000000 + patch * 10000 + stage
 
 
 def bump_module_prop(version):

@@ -54,21 +54,59 @@ reg_version() {
     | head -n 1
 }
 
-# 版本比较：$1 > $2 返回 0。按 x.y.z 逐段比数值，缺位补 0。
+# 版本比较：$1 > $2 返回 0。
+#
+# 先按 x.y.z 逐段比数字（缺位补 0），三段全相等时再看预发布后缀
+# （`3.5.0-beta.3` 里的 `-beta.3`）：
+#
+#   · 都没有后缀            → 相等，不算更高
+#   · 左边没有、右边有      → 左边更高（正式版 > 同号预发布）
+#   · 左边有、右边没有      → 左边更低
+#   · 都有后缀              → 比后缀里最大的数字段（beta.10 > beta.7，数字比不是字符串比）
+#
+# 后缀这一层是必须的：模块走 beta 通道时 PACK_VER 会带 `-beta.N`，
+# 而用户面板里可能已经装了同号的正式版。旧实现把两边的第三段都当成 0，
+# 于是「正式版 3.5.0」会被判成不比「beta.3」高，升级路径把正式版降级成预发布。
+#
 # 不用 sort -V —— Android 的 toybox sort 不保证支持它。
+ver_stage() {
+  # 后缀里最大的数字段；没有后缀返回 100（正式版恒大于同号预发布）
+  _vs_pre=${1#*-}
+  if [ "$_vs_pre" = "$1" ]; then printf '%s\n' 100; return 0; fi
+  _vs_max=0
+  _vs_rest=$_vs_pre
+  while [ -n "$_vs_rest" ]; do
+    _vs_piece=${_vs_rest%%.*}
+    _vs_piece=${_vs_piece%%-*}
+    case "$_vs_piece" in
+      ''|*[!0-9]*) : ;;
+      *) [ "$_vs_piece" -gt "$_vs_max" ] && _vs_max=$_vs_piece ;;
+    esac
+    case "$_vs_rest" in
+      *.*) _vs_rest=${_vs_rest#*.} ;;
+      *) break ;;
+    esac
+  done
+  printf '%s\n' "$_vs_max"
+}
+
 ver_gt() {
   _va=$1
   _vb=$2
   _vi=1
   while [ "$_vi" -le 3 ]; do
-    _vx=$(printf '%s' "$_va" | cut -d. -f"$_vi")
-    _vy=$(printf '%s' "$_vb" | cut -d. -f"$_vi")
+    _vx=$(printf '%s' "${_va%%-*}" | cut -d. -f"$_vi")
+    _vy=$(printf '%s' "${_vb%%-*}" | cut -d. -f"$_vi")
     case "$_vx" in ''|*[!0-9]*) _vx=0 ;; esac
     case "$_vy" in ''|*[!0-9]*) _vy=0 ;; esac
     if [ "$_vx" -gt "$_vy" ]; then return 0; fi
     if [ "$_vx" -lt "$_vy" ]; then return 1; fi
     _vi=$((_vi + 1))
   done
+  # 三段相等：比预发布后缀
+  _sa=$(ver_stage "$_va")
+  _sb=$(ver_stage "$_vb")
+  if [ "$_sa" -gt "$_sb" ]; then return 0; fi
   return 1
 }
 

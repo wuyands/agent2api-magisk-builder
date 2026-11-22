@@ -122,15 +122,21 @@ check(True, "must_present：有就通过")
 expect_error(lambda: base.must_present(p, "nope"), "不存在", "must_present：没有就报错")
 
 print("[5] versionCode 映射")
+# 规则：major*1e8 + minor*1e6 + patch*1e4 + stage（正式版 stage=100，预发布 stage=序号）
 for version, want in (
-    ("v3.4.2", 3040200),
-    ("v3.4.1", 3040100),
-    ("v3.4.0", 3040000),
-    ("v3.1.0", 3010000),
-    ("3.4.2", 3040200),
-    ("v4.0.0", 4000000),
-    ("v3.10.7", 3100700),
-    ("v4.0.7", 4000700),
+    ("v3.4.2", 304020100),
+    ("v3.4.1", 304010100),
+    ("v3.4.0", 304000100),
+    ("v3.1.0", 301000100),
+    ("3.4.2", 304020100),
+    ("v4.0.0", 400000100),
+    ("v3.10.7", 310070100),
+    ("v4.0.7", 400070100),
+    ("v3.5.0-beta.1", 305000001),
+    ("v3.5.0-beta.7", 305000007),
+    ("3.5.0-beta.7", 305000007),
+    ("v3.5.0-beta.10", 305000010),
+    ("v3.5.0", 305000100),
 ):
     got = prepare.code_of(version)
     check(got == want, "%s → %d" % (version, want))
@@ -143,8 +149,23 @@ codes = [prepare.code_of(v) for v in ordered]
 check(codes == sorted(codes) and len(set(codes)) == len(codes),
       "递增序列的 versionCode 严格单调：%s" % codes)
 
+# 预发布：同号里正式版最大，预发布按序号递增，且整条 beta 线都大于前一版正式版
+check(prepare.code_of("v3.5.0-beta.7") < prepare.code_of("v3.5.0"),
+      "3.5.0-beta.7 < 3.5.0（同号时正式版更大）")
+check(prepare.code_of("v3.5.0-beta.10") > prepare.code_of("v3.5.0-beta.7"),
+      "beta.10 > beta.7（按序号比，不是字符串比）")
+check(prepare.code_of("v3.5.0-beta.1") > prepare.code_of("v3.4.2"),
+      "3.5.0-beta.1 > 3.4.2（更高版本线的预发布仍大于旧正式版）")
+beta_line = ["v3.5.0-beta.1", "v3.5.0-beta.2", "v3.5.0-beta.7", "v3.5.0"]
+b_codes = [prepare.code_of(v) for v in beta_line]
+check(b_codes == sorted(b_codes) and len(set(b_codes)) == len(b_codes),
+      "beta 线严格单调：%s" % b_codes)
+
 check(prepare.code_of("v3.4.2") == __import__("verify").code_of("v3.4.2"),
       "verify.py 与 prepare.py 用的是同一套映射")
+for v in ("v3.5.0-beta.7", "v3.5.0", "v4.0.7"):
+    check(prepare.code_of(v) == __import__("verify").code_of(v),
+          "verify 与 prepare 对 %s 一致" % v)
 
 print("[6] 补丁清单")
 for group in engine.GROUPS:
@@ -167,14 +188,31 @@ print("[7] 上游版本判定")
 import upstream  # noqa: E402
 
 # 字符串比较会把 v3.10.0 判成比 v3.9.0 小；tags 接口的返回顺序也不是版本序。
-check(upstream.version_key("v3.4.2") == (3, 4, 2), "v3.4.2 → (3,4,2)")
-check(upstream.version_key("3.4.2") == (3, 4, 2), "不带 v 也能解析")
-check(upstream.version_key("v3.3.0-beta.6") is None, "beta 一律跳过")
+# 键是 (major, minor, patch, stage)，正式版 stage=100、预发布 stage=序号。
+check(upstream.version_key("v3.4.2") == (3, 4, 2, 100), "v3.4.2 → (3,4,2,100)")
+check(upstream.version_key("3.4.2") == (3, 4, 2, 100), "不带 v 也能解析")
+check(upstream.version_key("v3.3.0-beta.6") is None, "stable 通道下 beta 一律跳过")
 check(upstream.version_key("v3.4") is None, "位数不对的 tag 跳过")
 pairs = [("v3.9.0", "v3.10.0"), ("v3.4.1", "v3.4.2"), ("v3.10.7", "v4.0.0")]
 for low, high in pairs:
     check(upstream.version_key(high) > upstream.version_key(low),
           "%s > %s" % (high, low))
+
+# beta 通道：允许预发布，且排序规则必须能区分三种情况
+check(upstream.version_key("v3.5.0-beta.7", True) == (3, 5, 0, 7),
+      "beta 通道下 v3.5.0-beta.7 → (3,5,0,7)")
+check(upstream.version_key("v3.5.0", True) == (3, 5, 0, 100),
+      "beta 通道下正式版仍是 stage=100")
+check(upstream.version_key("v3.5.0-beta.7", True) < upstream.version_key("v3.5.0", True),
+      "同号时 3.5.0-beta.7 < 3.5.0")
+check(upstream.version_key("v3.5.0-beta.10", True) > upstream.version_key("v3.5.0-beta.7", True),
+      "beta.10 > beta.7（按序号比）")
+check(upstream.version_key("v3.5.0-beta.1", True) > upstream.version_key("v3.4.2", True),
+      "3.5.0-beta.1 > 3.4.2（预发布仍大过旧正式版）")
+check(upstream.version_key("v3.3.0-beta.5.1", True) is not None,
+      "上游发过的 beta.5.1 这种点连序号也能解析")
+check(upstream.version_key("v3.3.0-beta.6", True) > upstream.version_key("v3.3.0-beta.5.1", True),
+      "beta.6 > beta.5.1")
 
 # 插件仓库的 release 停在 v0.2.0（真版本只在 tag 上），如果按 releases 查会
 # 永远认为插件是 0.2.0。这条锁死「按 tag 取版本、release 只用来捞时间」这个决定。

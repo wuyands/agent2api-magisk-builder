@@ -100,15 +100,25 @@ def warn(msg):
 
 
 def code_of(version):
-    """与 prepare.code_of 同一套映射（major*1e6 + minor*1e4 + patch*1e2）。
+    """与 prepare.code_of 同一套映射（major*1e8 + minor*1e6 + patch*1e4 + stage）。
 
     两处必须一致，否则「自己生成、自己校验」会互相打架；这里刻意重写一份而不是
     import，是为了让 verify 能独立对着一个 zip 跑（不依赖构建机上的 prepare）。
+    正式版的 stage 是 100，预发布（``-beta.7``）是它的序号。
     """
-    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", version)
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.\-]+))?", version)
     if not m:
         return -1
-    return int(m.group(1)) * 1000000 + int(m.group(2)) * 10000 + int(m.group(3)) * 100
+    major, minor, patch = (int(x) for x in m.group(1, 2, 3))
+    pre = m.group(4)
+    if not pre:
+        stage = 100
+    else:
+        stage = 0
+        for piece in re.split(r"[.\-]", pre):
+            if piece.isdigit():
+                stage = max(stage, int(piece))
+    return major * 100000000 + minor * 1000000 + patch * 10000 + stage
 
 
 def check_files(tmp):
@@ -259,7 +269,7 @@ def check_binaries(tmp, plugin_version):
                  % (rel, plugin_version, [v for v in found if v.startswith(plugin_version[0])][:6]))
 
 
-def check_frontend(tmp):
+def check_frontend(tmp, patched=True):
     print("[5] 前端")
     ui_dir = os.path.join(tmp, "ui")
     n = sum(len(files) for _, _, files in os.walk(ui_dir))
@@ -278,6 +288,18 @@ def check_frontend(tmp):
         else:
             bad("%s 语法错误：%s" % (rel, r.stderr.strip().splitlines()[0][:200] if r.stderr else "?"))
 
+    uijs = open(os.path.join(tmp, "ui/islands/ui.js"), encoding="utf-8").read()
+
+    # install-info 是留给「详情」页的，必须还在（有没有裁都该在）
+    if "/api/tools/install-info" in uijs:
+        ok("ui.js 保留 install-info（详情页仍要显示 MCP 地址）")
+    else:
+        warn("ui.js 里找不到 install-info —— 详情页可能显示不出地址")
+
+    if not patched:
+        print("     （未打裁剪补丁：跳过「被删功能必须缺席」的检查）")
+        return
+
     app = open(os.path.join(tmp, "ui/app.js"), encoding="utf-8").read()
     for marker in ("syncUpdateBadge", "pollUpdateStatus", "updateUpdateBadge", "wbAgentPanel"):
         if marker in app:
@@ -294,7 +316,6 @@ def check_frontend(tmp):
             bad("ui/sidebar-layout.js 仍有 " + marker)
     ok("ui/sidebar-layout.js 无 Agent 菜单")
 
-    uijs = open(os.path.join(tmp, "ui/islands/ui.js"), encoding="utf-8").read()
     hit = False
     for marker, label in UI_ABSENT:
         if marker in uijs:
@@ -303,15 +324,12 @@ def check_frontend(tmp):
     if not hit:
         ok("ui.js 已去掉全部被删功能入口")
 
-    # install-info 是留给「详情」页的，必须还在
-    if "/api/tools/install-info" in uijs:
-        ok("ui.js 保留 install-info（详情页仍要显示 MCP 地址）")
-    else:
-        warn("ui.js 里找不到 install-info —— 详情页可能显示不出地址")
 
-
-def check_routes(source):
+def check_routes(source, patched=True):
     print("[6] 后端路由残留")
+    if not patched:
+        print("     （未打裁剪补丁：跳过路由残留扫描）")
+        return
     if not source or not os.path.isdir(source):
         warn("没给 --source，跳过源码扫描")
         return
@@ -406,10 +424,19 @@ def main():
     ap.add_argument("--version", required=True)
     ap.add_argument("--plugin-version", required=True)
     ap.add_argument("--source", default="", help="打完补丁的上游源码目录（用于扫路由残留）")
+    ap.add_argument(
+        "--no-patch",
+        action="store_true",
+        help="构建时没打裁剪补丁：跳过「被删功能必须缺席」与「路由无残留」这两组检查",
+    )
     args = ap.parse_args()
 
     if not os.path.isfile(args.zip):
         sys.exit("✗ zip 不存在：" + args.zip)
+
+    patched = not args.no_patch
+    if not patched:
+        print("！ 未打裁剪补丁（--no-patch）：只校验模块结构，不校验功能是否已裁")
 
     tmp = tempfile.mkdtemp(prefix="a2ab-verify-")
     try:
@@ -419,8 +446,8 @@ def main():
         check_prop(tmp, args.version)
         check_versions(tmp, args.version, args.plugin_version)
         check_binaries(tmp, args.plugin_version)
-        check_frontend(tmp)
-        check_routes(args.source)
+        check_frontend(tmp, patched)
+        check_routes(args.source, patched)
         check_shells(tmp)
         check_json(tmp)
         check_zip(args.zip, tmp)

@@ -12,13 +12,24 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "网关版本（形如 v3.4.2；留空读 upstream.json）"
+        description: "网关版本（形如 v3.4.2 或 v3.5.0-beta.7；留空读 upstream.json）"
         required: false
         type: string
       plugin_version:
-        description: "插件版本（形如 3.4.2；留空读 upstream.json）"
+        description: "插件版本（形如 3.4.2 或 3.5.0-beta.3；留空读 upstream.json）"
         required: false
         type: string
+      channel:
+        description: "上游通道：stable 只看正式版；beta 连预发布一起看"
+        required: false
+        default: stable
+        type: choice
+        options: [stable, beta]
+      patch:
+        description: "打裁剪补丁（关掉则按上游原样编，用于试跑新版）"
+        required: false
+        default: true
+        type: boolean
       release:
         description: "构建成功后发布 Release"
         required: false
@@ -33,6 +44,14 @@ on:
       plugin_version:
         required: false
         type: string
+      channel:
+        required: false
+        default: stable
+        type: string
+      patch:
+        required: false
+        default: true
+        type: boolean
       release:
         required: false
         default: true
@@ -42,7 +61,9 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-${{ inputs.version || 'auto' }}
+  # 打补丁与不打补丁的产物**不能共用**一个并发组：两者版本号可能相同，
+  # 但二进制、前端、自检结论完全不同，撞在一起会互相覆盖 artifact 与 Release。
+  group: build-${{ inputs.version || 'auto' }}-${{ inputs.patch == false && 'raw' || 'patched' }}
   cancel-in-progress: false
 
 env:
@@ -57,6 +78,8 @@ jobs:
     outputs:
       version: ${{ steps.ver.outputs.version }}
       plugin_version: ${{ steps.ver.outputs.plugin_version }}
+      channel: ${{ steps.ver.outputs.channel }}
+      patched: ${{ steps.ver.outputs.patched }}
       zip: ${{ steps.pack.outputs.zip }}
 
     steps:
@@ -68,21 +91,33 @@ jobs:
         env:
           IN_VERSION: ${{ inputs.version }}
           IN_PLUGIN: ${{ inputs.plugin_version }}
+          IN_CHANNEL: ${{ inputs.channel }}
+          IN_PATCH: ${{ inputs.patch }}
         run: |
           set -euo pipefail
           V="$IN_VERSION"
           P="$IN_PLUGIN"
+          C="${IN_CHANNEL:-stable}"
+          # inputs.patch 传下来是字符串（workflow_call 里空串也要当成「打补丁」，
+          # 不能因为空串就误判成 false）
+          case "$IN_PATCH" in
+            false|False|0) PATCHED=false ;;
+            *) PATCHED=true ;;
+          esac
           if [ -z "$V" ] || [ -z "$P" ]; then
-            OUT="$(python3 scripts/upstream.py)"
+            OUT="$(python3 scripts/upstream.py --channel "$C")"
             echo "$OUT"
             [ -z "$V" ] && V="$(printf '%s\n' "$OUT" | sed -n 's/^gateway=//p')"
             [ -z "$P" ] && P="$(printf '%s\n' "$OUT" | sed -n 's/^plugin=//p')"
           fi
           case "$V" in v*) ;; *) V="v$V" ;; esac
+          # 插件的 tag 不带 v（网关才是 v3.5.0-beta.7 那种叫法）
           case "$P" in v*) P="${P#v}" ;; esac
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "plugin_version=$P" >> "$GITHUB_OUTPUT"
-          echo "构建目标：网关 $V ＋ 插件 $P"
+          echo "channel=$C" >> "$GITHUB_OUTPUT"
+          echo "patched=$PATCHED" >> "$GITHUB_OUTPUT"
+          echo "构建目标：网关 $V ＋ 插件 $P（通道 $C，裁剪补丁 $PATCHED）"
 
       - name: 装 Python
         uses: actions/setup-python@v5
@@ -151,12 +186,37 @@ jobs:
             echo "插件源码：tag v${{ steps.ver.outputs.plugin_version }}"
           fi
 
-      # ── ② 打补丁 ──────────────────────────────────────────────
+      # ── ② 打补丁（可用 inputs.patch=false 整体跳过）────────────────
+      #
+      # 跳过时走的是「上游原样」：不打 11 个 Rust 补丁、不打 5 个前端补丁，
+      # 于是 Agent 配置页 / 工具本机接入 / 软件自更新 / Clash Verge 读取 /
+      # cc-switch 导入**全都还在**。这是给「上游发了新版，先看看它能不能
+      # 编过、跑不跑得起来」用的，不是给日常出包用的。
+      # 与之配套的两处联动：
+      #   · 构建后跑 `scripts/build-android-fixes.py` 补上游没覆盖的 Android 目标
+      #     （beta 里有 cfg 分支全落空的代码，桌面 CI 撞不出来）；
+      #   · 自检要加 `--no-patch`，否则「被裁功能必须缺席」那两组会把原样包判死。
       - name: 应用补丁（Rust）
+        if: ${{ steps.ver.outputs.patched == 'true' }}
         run: python3 patches/apply.py build/up --only rust
 
       - name: 应用补丁（前端）
+        if: ${{ steps.ver.outputs.patched == 'true' }}
         run: python3 patches/apply.py build/up --only frontend
+
+      - name: 说明当前是否打了裁剪补丁
+        run: |
+          if [ "${{ steps.ver.outputs.patched }}" = "true" ]; then
+            echo "已打裁剪补丁：产物将去掉桌面端专属功能"
+          else
+            echo "！未打裁剪补丁：产物包含上游全部功能（含桌面端专属部分）"
+          fi
+
+      # 上游没为 Android 目标做验证，个别代码在 arm64-linux-android 下会
+      # 推断不出类型（典型：三条 cfg 分支在不同平台上各 push 一种元素，
+      # Android 上一条都不成立）。这一步只做最小必要修补，不改行为。
+      - name: 补 Android 目标的编译修补
+        run: python3 -u scripts/android-target-fixes.py build/up
 
       # ── ③ 构建前端（必须早于 ④）────────────────────────────────
       - name: 装前端依赖（ui-islands）
@@ -229,11 +289,16 @@ jobs:
 
       - name: 自检
         run: |
+          # 未打裁剪补丁时，产物里本来就该有 Agent 配置页等入口，
+          # 那两组「被裁功能必须缺席 / 路由无残留」的检查会让它永远红。
+          flag=""
+          if [ "${{ steps.ver.outputs.patched }}" != "true" ]; then flag="--no-patch"; fi
           python3 scripts/verify.py \
             --zip "out/agent2api-magisk-${{ steps.ver.outputs.version }}.zip" \
             --version "${{ steps.ver.outputs.version }}" \
             --plugin-version "${{ steps.ver.outputs.plugin_version }}" \
-            --source build/up/desktop-tauri/src-tauri/server/src
+            --source build/up/desktop-tauri/src-tauri/server/src \
+            $flag
 
       - name: 留档（构建日志之外的可下载产物）
         uses: actions/upload-artifact@v4
@@ -244,8 +309,17 @@ jobs:
           retention-days: 30
 
       # ── 发布 ─────────────────────────────────────────────────
+      #
+      # 记录上游版本**只在打过补丁的构建里做**：upstream.json 是「日常出包跟到哪」的
+      # 水位线，一次原样试跑不该把它推上去 —— 否则 daily-sync 会以为这个版本已经
+      # 出过正式包，再也不补了。
       - name: 记录上游版本
-        run: python3 scripts/upstream.py --write --gateway "${{ steps.ver.outputs.version }}" --plugin "${{ steps.ver.outputs.plugin_version }}"
+        if: ${{ steps.ver.outputs.patched == 'true' }}
+        run: |
+          python3 scripts/upstream.py --write \
+            --channel "${{ steps.ver.outputs.channel }}" \
+            --gateway "${{ steps.ver.outputs.version }}" \
+            --plugin "${{ steps.ver.outputs.plugin_version }}"
 
       - name: 发布 Release
         if: ${{ inputs.release }}
@@ -253,9 +327,23 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           VERSION: ${{ steps.ver.outputs.version }}
           PLUGIN: ${{ steps.ver.outputs.plugin_version }}
+          CHANNEL: ${{ steps.ver.outputs.channel }}
+          PATCHED: ${{ steps.ver.outputs.patched }}
         run: |
           set -euo pipefail
           zip="out/agent2api-magisk-$VERSION.zip"
+
+          # 原样包与裁剪包**必须是两个 tag**：同一个上游版本可以既有一个「正式
+          # 模块」又有一个「试跑原样模块」，两者二进制与界面都不一样，共用一个
+          # tag 会互相覆盖资产，事后分不清哪个是能日常用的。
+          if [ "$PATCHED" = "true" ]; then
+            tag="$VERSION"
+            title="Agent2API Magisk 模块 $VERSION"
+          else
+            tag="$VERSION-raw"
+            title="Agent2API Magisk 模块 $VERSION（上游原样，未裁剪）"
+          fi
+
           sum="$(sha256sum "$zip" | cut -d' ' -f1)"
           notes="$RUNNER_TEMP/notes.md"
           {
@@ -263,7 +351,17 @@ jobs:
             echo ""
             echo "- 提供商插件 \`ProvidersPlugin/Agent2Providers\` **$PLUGIN**"
             echo "- 目标：Android arm64（API 26+），Magisk 20.4+"
-            echo "- 已裁掉桌面端专属功能（Agent 配置 / 工具本机接入 / 软件自更新 / Clash Verge / cc-switch 导入）"
+            if [ "$CHANNEL" = "beta" ]; then
+              echo "- 上游通道：**beta**（预发布，可能随时换掉；日常使用建议留在正式通道）"
+            fi
+            if [ "$PATCHED" = "true" ]; then
+              echo "- 已裁掉桌面端专属功能（Agent 配置 / 工具本机接入 / 软件自更新 / Clash Verge / cc-switch 导入）"
+            else
+              echo "- **未裁剪**：含上游全部功能，包括在手机上用不了的桌面端专属部分"
+              echo "  （Agent 配置页读不到也写不进客户端配置、本机接入装不了桌面客户端、"
+              echo "  软件自更新没有可替换的安装包、Clash Verge 配置不存在、cc-switch 导入无源）"
+              echo "- 只用于「上游新版能不能编过、跑不跑得起来」的验证，不要当日常包用"
+            fi
             echo ""
             echo '```'
             echo "sha256  $sum"
@@ -273,16 +371,21 @@ jobs:
             echo "\`su -c magisk --install-module /data/local/tmp/agent2api-magisk-$VERSION.zip\`，重启生效。"
           } > "$notes"
 
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "Release $VERSION 已存在，只补资产"
-            gh release upload "$VERSION" "$zip" --clobber
+          prerelease=""
+          case "$VERSION" in *-*) prerelease="--prerelease" ;; esac
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag 已存在，只补资产"
+            gh release upload "$tag" "$zip" --clobber
           else
-            gh release create "$VERSION" "$zip" \
-              --title "Agent2API Magisk 模块 $VERSION" \
-              --notes-file "$notes"
+            gh release create "$tag" "$zip" \
+              --title "$title" \
+              --notes-file "$notes" \
+              $prerelease
           fi
 
       - name: 提交 upstream.json
+        if: ${{ steps.ver.outputs.patched == 'true' }}
         run: |
           set -euo pipefail
           if git diff --quiet -- upstream.json; then
@@ -292,5 +395,5 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add upstream.json
-          git commit -m "chore: 记录上游版本 ${{ steps.ver.outputs.version }} / ${{ steps.ver.outputs.plugin_version }}"
+          git commit -m "chore: 记录上游版本 ${{ steps.ver.outputs.version }} / ${{ steps.ver.outputs.plugin_version }}（${{ steps.ver.outputs.channel }}）"
           git push
